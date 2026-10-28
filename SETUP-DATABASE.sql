@@ -1,0 +1,506 @@
+-- ============================================================================
+-- Performance Lab — 001 schema
+-- Run in Supabase: SQL Editor -> New query -> paste -> Run.
+-- Conventions: weights in kg, distances in metres, timestamps in UTC (timestamptz).
+-- Missing data is NULL, never 0.
+-- ============================================================================
+
+create extension if not exists "pgcrypto";
+
+-- Shared trigger: keep updated_at fresh
+create or replace function public.set_updated_at()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at = now();
+  return new;
+end $$;
+
+-- ---------------------------------------------------------------- profiles
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text,
+  birth_year int check (birth_year is null or birth_year between 1900 and 2100),
+  height_cm numeric check (height_cm is null or height_cm between 50 and 260),
+  preferred_weight_unit text not null default 'kg' check (preferred_weight_unit in ('kg','lb')),
+  preferred_distance_unit text not null default 'km' check (preferred_distance_unit in ('km','mi')),
+  preferred_theme text not null default 'dark' check (preferred_theme in ('dark','light')),
+  training_experience text check (training_experience in ('beginner','intermediate','advanced')),
+  primary_goal text,
+  week_starts_on int not null default 1 check (week_starts_on between 0 and 6),
+  default_rest_seconds int not null default 90 check (default_rest_seconds between 5 and 1800),
+  weekly_schedule jsonb not null default '{}'::jsonb,
+  settings jsonb not null default '{}'::jsonb,
+  onboarding_completed boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_profiles_updated before update on public.profiles
+  for each row execute function public.set_updated_at();
+
+-- Auto-create an empty profile when a user signs up. Narrow, reviewed SECURITY DEFINER:
+-- it only inserts the caller's own id into profiles.
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.profiles (id, display_name)
+  values (new.id, coalesce(new.raw_user_meta_data->>'display_name', split_part(new.email,'@',1)))
+  on conflict (id) do nothing;
+  return new;
+end $$;
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- --------------------------------------------------------------- exercises
+create table if not exists public.exercises (
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid references auth.users(id) on delete cascade,
+  name text not null check (char_length(name) between 1 and 120),
+  normalized_name text generated always as (lower(trim(name))) stored,
+  aliases text[] not null default '{}',
+  primary_muscles text[] not null default '{}',
+  secondary_muscles text[] not null default '{}',
+  equipment text[] not null default '{}',
+  category text,
+  movement_pattern text,
+  exercise_type text not null default 'weight_reps'
+    check (exercise_type in ('weight_reps','bodyweight_reps','assisted','cardio','isometric','mobility')),
+  tracking_config jsonb not null default '{"weight":true,"reps":true}'::jsonb,
+  instructions text,
+  common_mistakes text,
+  demo_url text,
+  is_system boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  -- system rows have no owner; custom rows must have one
+  constraint exercises_owner_rule check ((is_system and owner_id is null) or (not is_system and owner_id is not null)),
+  constraint exercises_tracking_is_object check (jsonb_typeof(tracking_config) = 'object')
+);
+create trigger trg_exercises_updated before update on public.exercises
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------- routines
+create table if not exists public.routines (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null check (char_length(name) between 1 and 80),
+  description text,
+  folder_name text,
+  is_example boolean not null default false,
+  archived_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_routines_updated before update on public.routines
+  for each row execute function public.set_updated_at();
+
+create table if not exists public.routine_exercises (
+  id uuid primary key default gen_random_uuid(),
+  routine_id uuid not null references public.routines(id) on delete cascade,
+  exercise_id uuid not null references public.exercises(id) on delete restrict,
+  position int not null check (position >= 0),
+  target_sets int check (target_sets is null or target_sets between 1 and 20),
+  target_min_reps int check (target_min_reps is null or target_min_reps >= 0),
+  target_max_reps int check (target_max_reps is null or target_max_reps >= 0),
+  target_weight_kg numeric check (target_weight_kg is null or target_weight_kg >= 0),
+  rest_seconds int check (rest_seconds is null or rest_seconds between 0 and 1800),
+  target_rpe numeric check (target_rpe is null or target_rpe between 1 and 10),
+  target_rir numeric check (target_rir is null or target_rir between 0 and 10),
+  progression_increment_kg numeric check (progression_increment_kg is null or progression_increment_kg > 0),
+  group_id uuid,
+  group_type text check (group_type is null or group_type in ('superset','circuit')),
+  notes text,
+  tracking_overrides jsonb,
+  unique (routine_id, position) deferrable initially deferred,
+  constraint reps_range_ok check (target_min_reps is null or target_max_reps is null or target_min_reps <= target_max_reps)
+);
+
+create table if not exists public.routine_schedule (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  routine_id uuid references public.routines(id) on delete cascade,
+  weekday int not null check (weekday between 0 and 6),   -- 0 = Sunday
+  is_rest_day boolean not null default false,
+  is_enabled boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint schedule_has_target check (is_rest_day or routine_id is not null)
+);
+create trigger trg_schedule_updated before update on public.routine_schedule
+  for each row execute function public.set_updated_at();
+
+-- ------------------------------------------------------------ workout data
+create table if not exists public.workout_sessions (
+  id uuid primary key,                       -- generated on the client => idempotent sync
+  user_id uuid not null references auth.users(id) on delete cascade,
+  routine_id uuid references public.routines(id) on delete set null,
+  name text not null default 'Workout',
+  status text not null default 'in_progress'
+    check (status in ('draft','in_progress','paused','completed','discarded')),
+  started_at timestamptz,
+  ended_at timestamptz,
+  duration_seconds int check (duration_seconds is null or duration_seconds >= 0),
+  session_notes text,
+  difficulty_rating int check (difficulty_rating is null or difficulty_rating between 1 and 10),
+  energy_rating int check (energy_rating is null or energy_rating between 1 and 5),
+  sleep_rating int check (sleep_rating is null or sleep_rating between 1 and 5),
+  source_device_id text,
+  version int not null default 1,            -- optimistic concurrency
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_sessions_updated before update on public.workout_sessions
+  for each row execute function public.set_updated_at();
+
+create table if not exists public.session_exercises (
+  id uuid primary key,
+  session_id uuid not null references public.workout_sessions(id) on delete cascade,
+  exercise_id uuid references public.exercises(id) on delete set null,
+  exercise_name_snapshot text not null,        -- history survives edits/deletes
+  position int not null check (position >= 0),
+  status text not null default 'active' check (status in ('active','skipped','done')),
+  group_id uuid,
+  group_type text check (group_type is null or group_type in ('superset','circuit')),
+  target_sets int,
+  target_min_reps int,
+  target_max_reps int,
+  rest_seconds int,
+  notes text,
+  tracking_snapshot jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_session_ex_updated before update on public.session_exercises
+  for each row execute function public.set_updated_at();
+
+create table if not exists public.sets (
+  id uuid primary key,
+  session_exercise_id uuid not null references public.session_exercises(id) on delete cascade,
+  set_number int not null check (set_number >= 1),
+  set_type text not null default 'normal'
+    check (set_type in ('warmup','normal','drop','failure','superset','circuit','rest_pause')),
+  weight_kg numeric check (weight_kg is null or weight_kg between 0 and 2000),
+  reps int check (reps is null or reps between 0 and 1000),
+  duration_seconds int check (duration_seconds is null or duration_seconds >= 0),
+  distance_meters numeric check (distance_meters is null or distance_meters >= 0),
+  assistance_kg numeric check (assistance_kg is null or assistance_kg >= 0),
+  added_weight_kg numeric check (added_weight_kg is null or added_weight_kg >= 0),
+  left_reps int check (left_reps is null or left_reps >= 0),
+  right_reps int check (right_reps is null or right_reps >= 0),
+  rpe numeric check (rpe is null or rpe between 1 and 10),
+  rir numeric check (rir is null or rir between 0 and 10),
+  is_completed boolean not null default false,
+  completed_at timestamptz,
+  notes text,
+  client_updated_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_sets_updated before update on public.sets
+  for each row execute function public.set_updated_at();
+
+-- ------------------------------------------------------------ body + misc
+create table if not exists public.body_measurements (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  measurement_type text not null
+    check (measurement_type in ('weight','waist','chest','hips','upper_arm','forearm','thigh','calf','neck','custom')),
+  custom_label text,
+  value numeric not null check (value > 0 and value < 1000),
+  unit text not null check (unit in ('kg','lb','cm','in')),
+  measured_at timestamptz not null default now(),
+  notes text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_measure_updated before update on public.body_measurements
+  for each row execute function public.set_updated_at();
+
+create table if not exists public.exercise_notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  exercise_id uuid not null references public.exercises(id) on delete cascade,
+  note_type text not null default 'setup' check (note_type in ('setup','technique','general')),
+  content text not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_exnotes_updated before update on public.exercise_notes
+  for each row execute function public.set_updated_at();
+
+create table if not exists public.exercise_settings (  -- per-user progression + favorites
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  exercise_id uuid not null references public.exercises(id) on delete cascade,
+  is_favorite boolean not null default false,
+  progression_enabled boolean not null default true,
+  progression_rule text not null default 'double' check (progression_rule in ('double','none')),
+  min_reps int,
+  max_reps int,
+  increment_kg numeric check (increment_kg is null or increment_kg > 0),
+  default_rest_seconds int,
+  unique (user_id, exercise_id)
+);
+
+create table if not exists public.personal_records (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  exercise_id uuid references public.exercises(id) on delete cascade,
+  record_type text not null check (record_type in ('max_weight','max_reps_at_load','est_1rm','session_volume','longest_duration','longest_distance')),
+  value numeric not null,
+  unit text not null,
+  session_id uuid references public.workout_sessions(id) on delete cascade,
+  set_id uuid references public.sets(id) on delete cascade,
+  achieved_at timestamptz not null,
+  is_estimated boolean not null default false,
+  created_at timestamptz not null default now(),
+  unique (user_id, exercise_id, record_type, set_id)   -- no duplicates from repeated sync
+);
+
+create table if not exists public.progress_photos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  storage_path text not null,
+  photo_category text check (photo_category is null or photo_category in ('front','side','back')),
+  captured_at timestamptz not null default now(),
+  notes text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.user_equipment (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  equipment_name text not null,
+  is_available boolean not null default true,
+  notes text,
+  unique (user_id, equipment_name)
+);
+
+create table if not exists public.user_goals (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  goal_type text not null check (goal_type in ('exercise_target','body_measurement','monthly_workouts','consistency','custom')),
+  title text not null,
+  exercise_id uuid references public.exercises(id) on delete set null,
+  target_value numeric,
+  target_unit text,
+  start_date date not null default current_date,
+  target_date date,
+  status text not null default 'active' check (status in ('active','completed','abandoned')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create trigger trg_goals_updated before update on public.user_goals
+  for each row execute function public.set_updated_at();
+-- Performance Lab — 002 indexes
+create index if not exists idx_exercises_owner on public.exercises(owner_id);
+create index if not exists idx_exercises_name on public.exercises(normalized_name);
+create index if not exists idx_exercises_primary on public.exercises using gin (primary_muscles);
+create index if not exists idx_exercises_equipment on public.exercises using gin (equipment);
+
+create index if not exists idx_routines_user on public.routines(user_id) where archived_at is null;
+create index if not exists idx_routine_ex_routine on public.routine_exercises(routine_id, position);
+create index if not exists idx_schedule_user on public.routine_schedule(user_id, weekday);
+
+create index if not exists idx_sessions_user_started on public.workout_sessions(user_id, started_at desc);
+create index if not exists idx_sessions_user_status on public.workout_sessions(user_id, status);
+create index if not exists idx_session_ex_session on public.session_exercises(session_id, position);
+create index if not exists idx_session_ex_exercise on public.session_exercises(exercise_id);
+create index if not exists idx_sets_session_ex on public.sets(session_exercise_id, set_number);
+
+create index if not exists idx_measure_user_type on public.body_measurements(user_id, measurement_type, measured_at desc);
+create index if not exists idx_pr_user_ex on public.personal_records(user_id, exercise_id, record_type);
+create index if not exists idx_photos_user on public.progress_photos(user_id, captured_at desc);
+create index if not exists idx_goals_user on public.user_goals(user_id, status);
+-- ============================================================================
+-- Performance Lab — 003 Row Level Security
+-- Every user-owned table is locked to auth.uid(). Child tables check ownership
+-- through their parent, never a client-supplied user id.
+-- ============================================================================
+
+alter table public.profiles           enable row level security;
+alter table public.exercises          enable row level security;
+alter table public.routines           enable row level security;
+alter table public.routine_exercises  enable row level security;
+alter table public.routine_schedule   enable row level security;
+alter table public.workout_sessions   enable row level security;
+alter table public.session_exercises  enable row level security;
+alter table public.sets               enable row level security;
+alter table public.body_measurements  enable row level security;
+alter table public.exercise_notes     enable row level security;
+alter table public.exercise_settings  enable row level security;
+alter table public.personal_records   enable row level security;
+alter table public.progress_photos    enable row level security;
+alter table public.user_equipment     enable row level security;
+alter table public.user_goals         enable row level security;
+
+-- profiles: own row only (insert is done by the signup trigger, but allow self-insert as a fallback)
+create policy "profiles_select_own" on public.profiles for select to authenticated using (id = auth.uid());
+create policy "profiles_insert_own" on public.profiles for insert to authenticated with check (id = auth.uid());
+create policy "profiles_update_own" on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
+create policy "profiles_delete_own" on public.profiles for delete to authenticated using (id = auth.uid());
+
+-- exercises: system rows readable by all signed-in users; custom rows are private to the owner
+create policy "exercises_select" on public.exercises for select to authenticated
+  using (is_system or owner_id = auth.uid());
+create policy "exercises_insert_own" on public.exercises for insert to authenticated
+  with check (not is_system and owner_id = auth.uid());
+create policy "exercises_update_own" on public.exercises for update to authenticated
+  using (not is_system and owner_id = auth.uid()) with check (not is_system and owner_id = auth.uid());
+create policy "exercises_delete_own" on public.exercises for delete to authenticated
+  using (not is_system and owner_id = auth.uid());
+
+-- routines
+create policy "routines_all_own" on public.routines for all to authenticated
+  using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+-- routine_exercises: via parent routine; exercise must be a system exercise or the user's own
+create policy "routine_ex_select" on public.routine_exercises for select to authenticated
+  using (exists (select 1 from public.routines r where r.id = routine_id and r.user_id = auth.uid()));
+create policy "routine_ex_modify" on public.routine_exercises for all to authenticated
+  using (exists (select 1 from public.routines r where r.id = routine_id and r.user_id = auth.uid()))
+  with check (
+    exists (select 1 from public.routines r where r.id = routine_id and r.user_id = auth.uid())
+    and exists (select 1 from public.exercises e where e.id = exercise_id and (e.is_system or e.owner_id = auth.uid()))
+  );
+
+create policy "schedule_all_own" on public.routine_schedule for all to authenticated
+  using (user_id = auth.uid())
+  with check (user_id = auth.uid() and (routine_id is null or exists (select 1 from public.routines r where r.id = routine_id and r.user_id = auth.uid())));
+
+-- workout sessions + children
+create policy "sessions_all_own" on public.workout_sessions for all to authenticated
+  using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+create policy "session_ex_all_own" on public.session_exercises for all to authenticated
+  using (exists (select 1 from public.workout_sessions s where s.id = session_id and s.user_id = auth.uid()))
+  with check (
+    exists (select 1 from public.workout_sessions s where s.id = session_id and s.user_id = auth.uid())
+    and (exercise_id is null or exists (select 1 from public.exercises e where e.id = exercise_id and (e.is_system or e.owner_id = auth.uid())))
+  );
+
+create policy "sets_all_own" on public.sets for all to authenticated
+  using (exists (
+    select 1 from public.session_exercises se join public.workout_sessions s on s.id = se.session_id
+    where se.id = session_exercise_id and s.user_id = auth.uid()))
+  with check (exists (
+    select 1 from public.session_exercises se join public.workout_sessions s on s.id = se.session_id
+    where se.id = session_exercise_id and s.user_id = auth.uid()));
+
+-- simple owner tables
+create policy "measure_all_own"  on public.body_measurements for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "exnotes_all_own"  on public.exercise_notes    for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "exsettings_all_own" on public.exercise_settings for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "pr_all_own"       on public.personal_records  for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "photos_all_own"   on public.progress_photos   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "equipment_all_own" on public.user_equipment   for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "goals_all_own"    on public.user_goals        for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+-- Anonymous visitors get nothing.
+revoke all on all tables in schema public from anon;
+grant select, insert, update, delete on all tables in schema public to authenticated;
+
+-- ----------------------------------------------------------------- Storage
+-- Private bucket for progress photos. Files live at  <user_id>/<filename>.
+insert into storage.buckets (id, name, public)
+values ('progress-photos', 'progress-photos', false)
+on conflict (id) do nothing;
+
+create policy "photos_storage_select" on storage.objects for select to authenticated
+  using (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "photos_storage_insert" on storage.objects for insert to authenticated
+  with check (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "photos_storage_delete" on storage.objects for delete to authenticated
+  using (bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ------------------------------------------------------- Account deletion
+-- Lets a signed-in user delete THEIR OWN account without a service-role key in the browser.
+-- Deleting the auth.users row cascades to every table above. Narrow, reviewed SECURITY DEFINER:
+-- it can only ever delete auth.uid().
+create or replace function public.delete_my_account()
+returns void language plpgsql security definer set search_path = public, auth, storage as $$
+begin
+  if auth.uid() is null then raise exception 'not authenticated'; end if;
+  delete from storage.objects where bucket_id = 'progress-photos' and (storage.foldername(name))[1] = auth.uid()::text;
+  delete from auth.users where id = auth.uid();
+end $$;
+revoke all on function public.delete_my_account() from public, anon;
+grant execute on function public.delete_my_account() to authenticated;
+-- Performance Lab — 004 starter exercise library (generated by tools/build-seed.mjs)
+-- Safe to re-run: existing rows are updated, nothing else is touched.
+insert into public.exercises (id, name, aliases, primary_muscles, secondary_muscles, equipment, movement_pattern, exercise_type, tracking_config, instructions, common_mistakes, is_system) values
+('6d55c51d-0bbf-5fdc-a8d9-00f5bf0e8bc2', 'Barbell Bench Press', array['bench press','flat bench']::text[], array['chest']::text[], array['triceps','shoulders']::text[], array['barbell','bench']::text[], 'horizontal_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Lie on a flat bench, grip slightly wider than shoulders, lower the bar to mid-chest under control, then press back up.', 'Bouncing the bar off the chest; flaring elbows to 90 degrees; lifting hips off the bench.', true),
+('e3f73ffa-6998-57d6-a367-4d8a47638691', 'Incline Dumbbell Press', array['incline db press']::text[], array['chest']::text[], array['shoulders','triceps']::text[], array['dumbbell','bench']::text[], 'incline_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Set the bench to a moderate incline, press dumbbells from shoulder level to above the upper chest.', 'Bench too steep so shoulders take over; letting dumbbells drift wide.', true),
+('91848d47-0fb4-5596-a7dd-ab479c364e5b', 'Dumbbell Bench Press', array['db bench']::text[], array['chest']::text[], array['triceps','shoulders']::text[], array['dumbbell','bench']::text[], 'horizontal_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Press two dumbbells from chest level to lockout, keeping wrists stacked over elbows.', 'Dropping too fast; clanging dumbbells together at the top.', true),
+('6d1554fa-4cb9-5993-a663-0f6f6029fe18', 'Incline Barbell Press', array[]::text[], array['chest']::text[], array['shoulders','triceps']::text[], array['barbell','bench']::text[], 'incline_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'On an incline bench, lower the bar to the upper chest and press it back up.', 'Arching excessively; bar path drifting toward the face.', true),
+('f33944a1-8771-5406-ac18-f3fb8cce28bb', 'Cable Fly', array['cable crossover']::text[], array['chest']::text[], array['shoulders']::text[], array['cable']::text[], 'fly', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'With cables set at chest height, step forward and bring the handles together in a wide arc with soft elbows.', 'Turning it into a press; overstretching the shoulder at the start.', true),
+('55261fd4-0c8c-55d6-a972-803f1163086b', 'Pec Deck Fly', array['machine fly']::text[], array['chest']::text[], array[]::text[], array['machine']::text[], 'fly', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Sit with back flat, bring the pads together in front of the chest, pause, and return slowly.', 'Shrugging shoulders; letting the weight stack crash down.', true),
+('6386a24d-db48-57ac-a7f9-6a8507524191', 'Push-Up', array['press up']::text[], array['chest']::text[], array['triceps','shoulders','abs']::text[], array['bodyweight']::text[], 'horizontal_push', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Hands under shoulders, body in a straight line, lower the chest to the floor and press away.', 'Sagging hips; flaring elbows; partial range.', true),
+('4e8a3ca5-af3b-52f1-a36a-1f793abd381e', 'Chest Dip', array['parallel bar dip']::text[], array['chest','triceps']::text[], array['shoulders']::text[], array['dip station','bodyweight']::text[], 'vertical_push', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Lean forward slightly, lower until upper arms are about parallel to the floor, then press up.', 'Going too deep for your shoulders; swinging.', true),
+('8f19c1d6-3d42-5ebc-a741-fc01b7a65d90', 'Assisted Dip', array['machine dip']::text[], array['chest','triceps']::text[], array['shoulders']::text[], array['machine']::text[], 'vertical_push', 'assisted', '{"reps":true,"assistance":true}'::jsonb, 'Kneel on the pad, set assistance, and perform dips with control.', 'Using so much assistance the movement gets too easy to progress.', true),
+('edd1c620-c5c4-58d8-a152-037829903140', 'Conventional Deadlift', array['deadlift']::text[], array['hamstrings','glutes','lower_back']::text[], array['back','forearms','traps']::text[], array['barbell']::text[], 'hinge', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Bar over mid-foot, hinge down, brace, and stand up by pushing the floor away, keeping the bar close.', 'Rounding the lower back; yanking the bar off the floor; bar drifting forward.', true),
+('e4a646f9-17df-562f-a84a-9501a953c548', 'Barbell Row', array['bent over row']::text[], array['back','lats']::text[], array['biceps','lower_back']::text[], array['barbell']::text[], 'horizontal_pull', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Hinge to about 45 degrees, pull the bar to the lower ribs, and lower under control.', 'Using momentum; standing up with each rep; rounding the back.', true),
+('6f903d69-1734-529d-ad30-98e803159426', 'Pull-Up', array['chin up wide']::text[], array['lats']::text[], array['biceps','back']::text[], array['pull-up bar','bodyweight']::text[], 'vertical_pull', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Hang from the bar, pull the chest toward it by driving elbows down, then lower fully.', 'Half reps; kipping; shrugging into the ears.', true),
+('e9d0720e-7213-508c-a85e-501d32884301', 'Chin-Up', array[]::text[], array['lats','biceps']::text[], array['back']::text[], array['pull-up bar','bodyweight']::text[], 'vertical_pull', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Underhand grip, pull until chin clears the bar, lower to a full hang.', 'Cutting range short; swinging.', true),
+('d3d830e9-d5b4-5605-aa92-122e869faacb', 'Assisted Pull-Up', array['machine pull up']::text[], array['lats']::text[], array['biceps','back']::text[], array['machine']::text[], 'vertical_pull', 'assisted', '{"reps":true,"assistance":true}'::jsonb, 'Kneel on the pad, pick an assistance level, and pull up smoothly.', 'Letting the pad bounce at the bottom.', true),
+('5c995f0c-f727-5aa0-a206-0c80ca485b9d', 'Lat Pulldown', array['pulldown']::text[], array['lats']::text[], array['biceps','back']::text[], array['cable','machine']::text[], 'vertical_pull', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Grip wide, lean back slightly, pull the bar to the upper chest, and control it back up.', 'Pulling behind the neck; swinging the torso.', true),
+('d0e76159-40f8-5d23-a533-7706e77337fc', 'Seated Cable Row', array['cable row']::text[], array['back']::text[], array['lats','biceps']::text[], array['cable']::text[], 'horizontal_pull', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Sit tall, pull the handle to the stomach, squeeze the shoulder blades, and return with control.', 'Rocking the torso; shrugging.', true),
+('cb4bff75-b278-5c9b-af06-31e5c7acd98c', 'One-Arm Dumbbell Row', array['db row']::text[], array['lats','back']::text[], array['biceps']::text[], array['dumbbell','bench']::text[], 'horizontal_pull', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Support one hand on a bench, pull the dumbbell toward the hip, and lower fully.', 'Twisting the torso; yanking with the arm.', true),
+('d7813f17-01b3-5dfc-ac7f-379af5732b86', 'T-Bar Row', array[]::text[], array['back']::text[], array['lats','biceps']::text[], array['machine']::text[], 'horizontal_pull', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Chest supported or hinged, pull the handle to the torso and lower with control.', 'Jerking; losing a flat back.', true),
+('ac039089-7b3f-59bc-a329-cb63dbf181b0', 'Face Pull', array[]::text[], array['shoulders','upper_back']::text[], array['traps']::text[], array['cable']::text[], 'horizontal_pull', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Set the rope at face height, pull toward the eyes with elbows high, and rotate the hands outward.', 'Pulling too heavy so the lower back leans; elbows dropping.', true),
+('de209840-a648-56a7-a593-1e2b7cbd453c', 'Back Extension', array['hyperextension']::text[], array['lower_back']::text[], array['glutes','hamstrings']::text[], array['machine','bodyweight']::text[], 'hinge', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Hinge at the hips over the pad and lift the torso to a straight line.', 'Hyperextending at the top.', true),
+('82125c9e-0228-5075-a9a2-a355e969c3f5', 'Barbell Shrug', array[]::text[], array['traps']::text[], array['forearms']::text[], array['barbell']::text[], 'carry', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Hold the bar in front of the thighs and lift the shoulders straight up, then lower slowly.', 'Rolling the shoulders; using the legs.', true),
+('e6bd1cac-6b26-5d6b-a25d-3249a4543fb8', 'Overhead Press', array['ohp','military press']::text[], array['shoulders']::text[], array['triceps','abs']::text[], array['barbell']::text[], 'vertical_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Bar at shoulder height, brace, press overhead until the arms lock, and lower back to the shoulders.', 'Leaning back heavily; not finishing lockout.', true),
+('e24e3938-b6c4-561a-a46f-491542758c6a', 'Dumbbell Shoulder Press', array['db shoulder press']::text[], array['shoulders']::text[], array['triceps']::text[], array['dumbbell','bench']::text[], 'vertical_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Press dumbbells from shoulder height to overhead without arching the lower back.', 'Excessive arch; uneven reps.', true),
+('07b0d09c-a6af-51a9-a6ba-2489d0081803', 'Dumbbell Lateral Raise', array['side raise']::text[], array['shoulders']::text[], array[]::text[], array['dumbbell']::text[], 'raise', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Raise dumbbells out to the sides to shoulder height with a slight elbow bend.', 'Swinging; going far above shoulder height.', true),
+('e4a83fc1-56a8-56f8-ac2b-74bd7877765f', 'Cable Lateral Raise', array[]::text[], array['shoulders']::text[], array[]::text[], array['cable']::text[], 'raise', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Stand side-on to a low cable and lift the handle out to shoulder height.', 'Using momentum.', true),
+('ed7cf4ee-22a7-5985-ae03-f7a0e89ac570', 'Rear Delt Fly', array['reverse fly']::text[], array['shoulders','upper_back']::text[], array[]::text[], array['dumbbell','machine']::text[], 'fly', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Hinge forward and raise the weights out to the sides, squeezing the rear shoulders.', 'Using the traps; swinging.', true),
+('f6c3178a-d7a8-5a22-a6d2-652e01daf688', 'Arnold Press', array[]::text[], array['shoulders']::text[], array['triceps']::text[], array['dumbbell']::text[], 'vertical_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Start with palms facing you, rotate as you press overhead, and reverse on the way down.', 'Rushing the rotation.', true),
+('beaced02-ac44-56f7-ac85-776b492245f4', 'Barbell Curl', array['bb curl']::text[], array['biceps']::text[], array['forearms']::text[], array['barbell']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Curl the bar to shoulder height keeping elbows by your sides, then lower slowly.', 'Swinging the torso; elbows drifting forward.', true),
+('484e5a7e-7077-55b0-a90a-f042673ebca0', 'Dumbbell Curl', array['db curl']::text[], array['biceps']::text[], array['forearms']::text[], array['dumbbell']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Curl dumbbells with a supinating wrist, pause at the top, and lower under control.', 'Using momentum; partial range.', true),
+('52469082-debd-5db6-a475-2b2a14158dd3', 'Hammer Curl', array[]::text[], array['biceps','forearms']::text[], array[]::text[], array['dumbbell']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Hold the dumbbells with palms facing each other and curl up without rotating the wrist.', 'Swinging the weights.', true),
+('9a6fddc3-44b4-5401-aac6-03a6abb46d8b', 'Preacher Curl', array[]::text[], array['biceps']::text[], array[]::text[], array['barbell','machine']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Rest the upper arms on the pad, curl up, and lower to near full extension.', 'Dropping the weight hard at the bottom.', true),
+('0d879af5-63ee-5648-a09c-03102c729f6b', 'Cable Curl', array[]::text[], array['biceps']::text[], array[]::text[], array['cable']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'With a low cable, curl the handle up while keeping elbows still.', 'Leaning back.', true),
+('d5d41c6d-6be9-5b60-a0b3-84f56cb90aa4', 'Triceps Pushdown', array['cable pushdown']::text[], array['triceps']::text[], array[]::text[], array['cable']::text[], 'extension', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Elbows pinned at your sides, push the handle down to full extension and return slowly.', 'Elbows flaring; leaning over the weight.', true),
+('883fd6eb-0004-54e2-ab51-68c7ceca821e', 'Overhead Triceps Extension', array[]::text[], array['triceps']::text[], array[]::text[], array['dumbbell','cable']::text[], 'extension', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Hold a weight overhead, lower it behind the head by bending the elbows, and extend back up.', 'Flaring elbows wide.', true),
+('6370722e-d2d6-5966-a7f3-8514cb577971', 'Skull Crusher', array['lying triceps extension']::text[], array['triceps']::text[], array[]::text[], array['barbell','bench']::text[], 'extension', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Lying on a bench, lower the bar toward the forehead by bending the elbows, then extend.', 'Letting elbows drift; too heavy.', true),
+('b9bf0fb6-bc6c-5b9f-ab40-d5873b2a0630', 'Close-Grip Bench Press', array[]::text[], array['triceps']::text[], array['chest','shoulders']::text[], array['barbell','bench']::text[], 'horizontal_push', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Use a shoulder-width grip and keep elbows tucked as you press.', 'Grip too narrow, stressing the wrists.', true),
+('6b5f3f44-b87c-5528-a982-4bd9f7f494f5', 'Bench Dip', array[]::text[], array['triceps']::text[], array['shoulders','chest']::text[], array['bench','bodyweight']::text[], 'vertical_push', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Hands on a bench behind you, lower the hips by bending the elbows, and press up.', 'Shoulders rolling forward; going too deep.', true),
+('b56574bd-637c-5050-af5b-fc280fb2459d', 'Wrist Curl', array[]::text[], array['forearms']::text[], array[]::text[], array['dumbbell','barbell']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Forearms on a bench, curl the weight up using only the wrists.', 'Using too much weight.', true),
+('6c1329f7-197d-5bd1-a839-5b10deb33ae6', 'Farmer''s Carry', array['farmer walk']::text[], array['forearms','traps']::text[], array['abs','glutes']::text[], array['dumbbell']::text[], 'carry', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Hold heavy weights at your sides and walk with an upright posture.', 'Leaning to one side; short, rushed steps.', true),
+('f50f3507-9418-5ddb-aea8-0ec3f9e448fa', 'Barbell Back Squat', array['squat']::text[], array['quads','glutes']::text[], array['hamstrings','lower_back','abs']::text[], array['barbell','squat rack']::text[], 'squat', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Bar on the upper back, brace, sit down and back to at least parallel, then stand up.', 'Knees caving; heels lifting; rounding the lower back.', true),
+('92523947-16c3-521e-a52e-8f60d1b72347', 'Front Squat', array[]::text[], array['quads']::text[], array['glutes','abs']::text[], array['barbell','squat rack']::text[], 'squat', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Rest the bar on the front shoulders, keep the torso upright, squat to depth and stand.', 'Elbows dropping; rounding the upper back.', true),
+('aeb1c09c-4769-5025-ae10-b6f0f6b85e11', 'Goblet Squat', array[]::text[], array['quads','glutes']::text[], array['abs']::text[], array['dumbbell']::text[], 'squat', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Hold a dumbbell at the chest, squat deep with an upright torso, and stand.', 'Heels rising; leaning forward.', true),
+('00182f7a-2dd2-5f4b-a38b-40fd216f3ac5', 'Leg Press', array[]::text[], array['quads','glutes']::text[], array['hamstrings']::text[], array['machine']::text[], 'squat', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Feet shoulder-width on the platform, lower until the knees reach about 90 degrees, and press.', 'Lower back rounding off the pad; locking knees hard.', true),
+('db56843b-8f84-5ee4-a37d-e36106c281a0', 'Leg Extension', array[]::text[], array['quads']::text[], array[]::text[], array['machine']::text[], 'extension', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Extend the knees to full lockout, pause, and lower slowly.', 'Swinging the weight up.', true),
+('210c129f-8b65-5ac4-ae58-1f8ffc7ab935', 'Bulgarian Split Squat', array['rear foot elevated split squat']::text[], array['quads','glutes']::text[], array['hamstrings']::text[], array['dumbbell','bench']::text[], 'lunge', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Rear foot on a bench, lower the back knee toward the floor, and drive up through the front foot.', 'Front foot too close; knee collapsing inward.', true),
+('2897ba8c-2b53-5d7a-a0d3-ba66632b3f5b', 'Walking Lunge', array['lunge']::text[], array['quads','glutes']::text[], array['hamstrings']::text[], array['dumbbell','bodyweight']::text[], 'lunge', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Step forward, lower the back knee, and drive through the front leg into the next step.', 'Short steps; torso collapsing forward.', true),
+('98bdace9-72f0-5088-aef2-ecf461ab04bd', 'Hack Squat', array[]::text[], array['quads']::text[], array['glutes']::text[], array['machine']::text[], 'squat', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Back on the pad, lower under control to depth and push the platform away.', 'Heels lifting; bouncing at the bottom.', true),
+('22a0c7d7-e183-5da7-a25a-ada71287e43e', 'Romanian Deadlift', array['rdl']::text[], array['hamstrings','glutes']::text[], array['lower_back']::text[], array['barbell','dumbbell']::text[], 'hinge', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'With soft knees, push the hips back and lower the weight along the legs until the hamstrings stretch, then stand.', 'Rounding the back; turning it into a squat.', true),
+('989d4af6-ace1-5b7e-ae5a-176f14b8bb7a', 'Lying Leg Curl', array['leg curl']::text[], array['hamstrings']::text[], array['calves']::text[], array['machine']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Curl the pad toward the glutes and lower slowly.', 'Lifting the hips; jerking the weight.', true),
+('4c4081d9-994c-51d0-ad3b-435ca0a562fe', 'Seated Leg Curl', array[]::text[], array['hamstrings']::text[], array[]::text[], array['machine']::text[], 'curl', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Sit tight into the pad and curl the lever under the seat, then return slowly.', 'Using momentum.', true),
+('9a507062-aa4c-5090-a733-f10d2cec543b', 'Barbell Hip Thrust', array['hip thrust']::text[], array['glutes']::text[], array['hamstrings']::text[], array['barbell','bench']::text[], 'hinge', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Upper back on a bench, drive the hips up until the torso is level, squeeze, and lower.', 'Overarching the lower back at the top.', true),
+('d41e45ca-280f-57d6-ac86-6125be8f2850', 'Glute Bridge', array[]::text[], array['glutes']::text[], array['hamstrings']::text[], array['bodyweight']::text[], 'hinge', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Lie on your back, drive the hips up by squeezing the glutes, and lower.', 'Pushing through the toes.', true),
+('00e73cf3-f22a-5ec9-a538-1ec575436b48', 'Cable Glute Kickback', array[]::text[], array['glutes']::text[], array[]::text[], array['cable']::text[], 'extension', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'With an ankle strap, kick the leg back and squeeze the glute without arching.', 'Swinging the leg using the lower back.', true),
+('f992623d-794a-5f1c-add1-3e639d6de3fb', 'Standing Calf Raise', array[]::text[], array['calves']::text[], array[]::text[], array['machine','dumbbell']::text[], 'raise', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Rise onto the toes as high as possible, pause, then lower to a full stretch.', 'Bouncing; cutting the stretch short.', true),
+('00b95ab1-3b81-5314-a19a-1474ea8a188f', 'Seated Calf Raise', array[]::text[], array['calves']::text[], array[]::text[], array['machine']::text[], 'raise', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Press through the balls of the feet, pause at the top, and stretch at the bottom.', 'Rushing the reps.', true),
+('b425923d-bb5a-534d-a2fb-69879d5f5009', 'Plank', array[]::text[], array['abs']::text[], array['shoulders','glutes']::text[], array['bodyweight']::text[], 'core', 'isometric', '{"duration":true}'::jsonb, 'Forearms on the floor, body in a straight line, brace and hold.', 'Hips sagging or piking.', true),
+('c438e914-d52a-5460-ae1d-75a98dbc228d', 'Hanging Leg Raise', array[]::text[], array['abs']::text[], array['forearms']::text[], array['pull-up bar']::text[], 'core', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Hang from a bar and raise the legs, curling the pelvis up, then lower slowly.', 'Swinging.', true),
+('bf809fe6-daab-5e7f-a20d-595ca519999b', 'Cable Crunch', array[]::text[], array['abs']::text[], array[]::text[], array['cable']::text[], 'core', 'weight_reps', '{"weight":true,"reps":true}'::jsonb, 'Kneel at a high cable and crunch the ribs toward the pelvis.', 'Pulling with the arms or hips.', true),
+('e4c585f1-d756-5b15-af18-8f41bf04de37', 'Ab Wheel Rollout', array[]::text[], array['abs']::text[], array['shoulders','lower_back']::text[], array['ab wheel']::text[], 'core', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'From the knees, roll forward with a braced core and pull back.', 'Letting the lower back sag.', true),
+('34b9a763-4012-5828-afc5-48edd2c01d2f', 'Russian Twist', array[]::text[], array['obliques','abs']::text[], array[]::text[], array['bodyweight','dumbbell']::text[], 'rotation', 'bodyweight_reps', '{"reps":true,"added_weight":true}'::jsonb, 'Seated with a slight lean back, rotate the torso side to side.', 'Moving only the arms.', true),
+('9ef6da27-0def-5b6d-a7e4-33cbca33496b', 'Side Plank', array[]::text[], array['obliques']::text[], array['abs','shoulders']::text[], array['bodyweight']::text[], 'core', 'isometric', '{"duration":true}'::jsonb, 'Prop on one forearm, lift the hips, and hold a straight line.', 'Hips dropping.', true),
+('33dfc9ec-e855-5776-ad3e-a89c0c3c4027', 'Treadmill Run', array['running']::text[], array['cardio']::text[], array['quads','calves']::text[], array['treadmill']::text[], 'locomotion', 'cardio', '{"duration":true,"distance":true,"speed":true,"incline":true,"heart_rate":true}'::jsonb, 'Set speed and incline, maintain an upright posture, and breathe steadily.', 'Holding the rails; overstriding.', true),
+('487b0aad-3d69-511e-ad15-d1482eb1ca72', 'Incline Treadmill Walk', array['12-3-30']::text[], array['cardio']::text[], array['glutes','calves']::text[], array['treadmill']::text[], 'locomotion', 'cardio', '{"duration":true,"distance":true,"speed":true,"incline":true,"heart_rate":true}'::jsonb, 'Walk briskly at a steady incline without holding on.', 'Leaning heavily on the handles.', true),
+('a0fef55d-2942-5193-aa8a-3c7046a169f1', 'Stationary Bike', array['cycling']::text[], array['cardio']::text[], array['quads']::text[], array['bike']::text[], 'locomotion', 'cardio', '{"duration":true,"distance":true,"speed":true,"incline":true,"heart_rate":true}'::jsonb, 'Adjust the seat so the knee stays slightly bent at the bottom, then pedal at a steady cadence.', 'Seat too low.', true),
+('a244bc03-10be-59bd-ac5b-ddf9ec52a837', 'Rowing Machine', array['erg']::text[], array['cardio']::text[], array['back','quads']::text[], array['rower']::text[], 'locomotion', 'cardio', '{"duration":true,"distance":true,"speed":true,"incline":true,"heart_rate":true}'::jsonb, 'Drive with the legs, lean back slightly, pull the handle to the ribs, then reverse the order.', 'Pulling with the arms first.', true),
+('c25b82fb-6578-5e68-a2ba-d14c33e82ad5', 'Elliptical', array['cross trainer']::text[], array['cardio']::text[], array[]::text[], array['elliptical']::text[], 'locomotion', 'cardio', '{"duration":true,"distance":true,"speed":true,"incline":true,"heart_rate":true}'::jsonb, 'Stand tall and move smoothly through the stride without leaning on the handles.', 'Slouching.', true),
+('e643ac30-dfed-54d1-a92f-806030760afb', 'Jump Rope', array['skipping']::text[], array['cardio']::text[], array['calves']::text[], array['rope']::text[], 'locomotion', 'cardio', '{"duration":true,"distance":true,"speed":true,"incline":true,"heart_rate":true}'::jsonb, 'Turn the rope with the wrists and make small hops on the balls of the feet.', 'Jumping too high.', true),
+('55fa437a-0051-5f38-a9be-1f8512fd573e', 'Half-Kneeling Hip Flexor Stretch', array[]::text[], array['quads']::text[], array['glutes']::text[], array['bodyweight']::text[], 'stretch', 'mobility', '{"duration":true,"reps":true}'::jsonb, 'Kneel on one knee, tuck the pelvis, and shift forward until you feel a stretch at the front of the hip.', 'Arching the lower back.', true),
+('91870b59-e235-508d-ae95-0ed05ac0124f', 'Cat-Cow', array[]::text[], array['lower_back']::text[], array['abs']::text[], array['bodyweight']::text[], 'stretch', 'mobility', '{"duration":true,"reps":true}'::jsonb, 'On hands and knees, alternate arching and rounding the spine slowly with the breath.', 'Rushing.', true),
+('6251fca0-2945-5368-a11e-d0ba0b992916', 'Thoracic Rotation', array['open book']::text[], array['upper_back']::text[], array['obliques']::text[], array['bodyweight']::text[], 'rotation', 'mobility', '{"duration":true,"reps":true}'::jsonb, 'Lie on your side with knees bent and rotate the upper arm and chest open.', 'Letting the knees move apart.', true),
+('e2d07eb8-d936-59f8-adf9-a0f2999bc03c', 'Hamstring Stretch', array[]::text[], array['hamstrings']::text[], array['calves']::text[], array['bodyweight']::text[], 'stretch', 'mobility', '{"duration":true,"reps":true}'::jsonb, 'Extend one leg, hinge forward with a long spine, and hold.', 'Rounding the back to reach farther.', true)
+on conflict (id) do update set name = excluded.name, aliases = excluded.aliases, primary_muscles = excluded.primary_muscles,
+  secondary_muscles = excluded.secondary_muscles, equipment = excluded.equipment, movement_pattern = excluded.movement_pattern,
+  exercise_type = excluded.exercise_type, tracking_config = excluded.tracking_config, instructions = excluded.instructions,
+  common_mistakes = excluded.common_mistakes;

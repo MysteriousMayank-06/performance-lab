@@ -1,0 +1,122 @@
+/* ==========================================================================
+   Performance Lab — design tokens
+   Liquid-glass look: deep blue gradient stage + frosted glass + light sheets.
+   All spacing is a multiple of 4px.
+   ========================================================================== */
+
+:root {
+  /* ---- Stage (the blue gradient behind everything) ---- */
+  --stage-top: #0a2a8f;
+  --stage-mid: #0a2370;
+  --stage-bottom: #050f33;
+  --stage-glow: rgba(70, 130, 255, 0.55);
+
+  /* ---- Accent (used sparingly: PRs, success, active highlights) ---- */
+  --accent: #c6ff3d;
+  --accent-ink: #12200a;
+  --brand: #2f6bff;
+
+  /* ---- Status ---- */
+  --success: #2fd27a;
+  --warning: #ffb02e;
+  --danger: #ff5a6a;
+  --info: #5ab0ff;
+
+  /* ---- Glass (on the blue stage) ---- */
+  --glass-bg: linear-gradient(160deg, rgba(255,255,255,.22), rgba(255,255,255,.07));
+  --glass-bg-flat: rgba(255, 255, 255, 0.12);
+  --glass-bg-strong: rgba(255, 255, 255, 0.2);
+  --glass-border: rgba(255, 255, 255, 0.28);
+  --glass-highlight: rgba(255, 255, 255, 0.55);
+  --glass-shadow: 0 10px 30px rgba(3, 12, 50, 0.35);
+  --glass-blur: 22px;
+  --glass-saturate: 1.6;
+  --on-stage: #ffffff;
+  --on-stage-muted: rgba(255, 255, 255, 0.68);
+
+  /* ---- Sheet (the light panel that slides over the stage) ---- */
+  --sheet-bg: #ffffff;
+  --sheet-surface: #f3f5f9;
+  --sheet-surface-2: #e8ecf3;
+  --sheet-border: rgba(10, 20, 50, 0.08);
+  --text: #0b1020;
+  --text-muted: #5d6579;
+  --text-faint: #8f97aa;
+  --ink-btn: #0b0f1d;
+  --ink-btn-text: #ffffff;
+
+  /* ---- Spacing scale ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* ---- Typography (system-first, free) ---- */
+  --font: "Inter", "SF Pro Display", "Roboto Flex", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8125rem;
+  --fs-md: 0.9375rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.5rem;
+  --fs-2xl: 2rem;
+  --fs-hero: 2.75rem;
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  /* ---- Radii ---- */
+  --r-sm: 12px;
+  --r-md: 16px;
+  --r-lg: 24px;
+  --r-xl: 32px;
+  --r-pill: 999px;
+
+  /* ---- Motion ---- */
+  --dur-fast: 120ms;
+  --dur: 220ms;
+  --dur-slow: 420ms;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ---- Layout ---- */
+  --header-h: 64px;
+  --nav-h: 72px;
+  --touch: 48px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* ---- Z layers ---- */
+  --z-sheet: 10;
+  --z-nav: 40;
+  --z-overlay: 60;
+  --z-dialog: 70;
+  --z-toast: 90;
+}
+
+/* Dark variant of the sheet (the stage is already dark). */
+:root[data-theme="dark"] {
+  --sheet-bg: #0e1426;
+  --sheet-surface: #172038;
+  --sheet-surface-2: #202b49;
+  --sheet-border: rgba(255, 255, 255, 0.08);
+  --text: #f2f5ff;
+  --text-muted: #a3adc6;
+  --text-faint: #6f7a96;
+  --ink-btn: #ffffff;
+  --ink-btn-text: #0b0f1d;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 1ms;
+    --dur: 1ms;
+    --dur-slow: 1ms;
+  }
+}
